@@ -4,7 +4,7 @@ import os
 import random
 import sys
 
-import json
+from typing import Tuple
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,7 +14,12 @@ from runners.support.agent import (  # noqa:E402
     start_mediator_agent,
     connect_wallet_to_mediator,
 )
-from runners.support.utils import log_timer, progress, require_indy  # noqa:E402
+from runners.support.utils import (  # noqa:E402
+    log_msg,
+    log_timer,
+    progress,
+    require_indy,
+)
 
 CRED_PREVIEW_TYPE = "https://didcomm.org/issue-credential/2.0/credential-preview"
 LOGGER = logging.getLogger(__name__)
@@ -89,7 +94,7 @@ class BaseAgent(DemoAgent):
             self.ping_state[thread_id] = payload["state"]
             self.ping_event.set()
 
-    async def check_received_creds(self) -> (int, int):
+    async def check_received_creds(self) -> Tuple[int, int]:
         while True:
             self.credential_event.clear()
             pending = 0
@@ -104,7 +109,7 @@ class BaseAgent(DemoAgent):
     async def update_creds(self):
         await self.credential_event.wait()
 
-    async def check_received_pings(self) -> (int, int):
+    async def check_received_pings(self) -> Tuple[int, int]:
         while True:
             self.ping_event.clear()
             result = {}
@@ -151,6 +156,27 @@ class AliceAgent(BaseAgent):
     async def fetch_credential_definition(self, cred_def_id):
         return await self.admin_GET(f"/credential-definitions/{cred_def_id}")
 
+    async def propose_credential(
+        self,
+        cred_attrs: dict,
+        cred_def_id: str,
+        comment: str = None,
+        auto_remove: bool = True,
+    ):
+        cred_preview = {
+            "attributes": [{"name": n, "value": v} for (n, v) in cred_attrs.items()]
+        }
+        await self.admin_POST(
+            "/issue-credential/send-proposal",
+            {
+                "connection_id": self.connection_id,
+                "cred_def_id": cred_def_id,
+                "credential_proposal": cred_preview,
+                "comment": comment,
+                "auto_remove": auto_remove,
+            },
+        )
+
 
 class FaberAgent(BaseAgent):
     def __init__(self, port: int, **kwargs):
@@ -159,6 +185,8 @@ class FaberAgent(BaseAgent):
             "--auto-accept-invites",
             "--auto-accept-requests",
             "--monitor-ping",
+            "--auto-respond-credential-proposal",
+            "--auto-respond-credential-request",
         ]
         self.schema_id = None
         self.credential_definition_id = None
@@ -195,17 +223,6 @@ class FaberAgent(BaseAgent):
         ]
         self.log(f"Credential Definition ID: {self.credential_definition_id}")
 
-        # create revocation registry
-        # if support_revocation:
-        #     revoc_body = {
-        #         "credential_definition_id": self.credential_definition_id,
-        #     }
-        #     revoc_response = await self.admin_POST(
-        #         "/revocation/create-registry", revoc_body
-        #     )
-        #     self.revocation_registry_id = revoc_response["result"]["revoc_reg_id"]
-        #     self.log(f"Revocation Registry ID: {self.revocation_registry_id}")
-
     async def send_credential(
         self, cred_attrs: dict, comment: str = None, auto_remove: bool = True
     ):
@@ -226,7 +243,7 @@ class FaberAgent(BaseAgent):
 
     async def revoke_credential(self, cred_ex_id: str):
         await self.admin_POST(
-            f"/revocation/revoke",
+            "/revocation/revoke",
             {
                 "cred_ex_id": cred_ex_id,
                 "publish": True,
@@ -237,7 +254,7 @@ class FaberAgent(BaseAgent):
 async def main(
     start_port: int,
     threads: int = 20,
-    ping_only: bool = False,
+    action: str = None,
     show_timing: bool = False,
     multitenant: bool = False,
     mediation: bool = False,
@@ -317,7 +334,8 @@ async def main(
                     mediator_agent=faber_mediator_agent,
                 )
             elif mediation:
-                # we need to pre-connect the agent(s) to their mediator (use the same mediator for both)
+                # we need to pre-connect the agent(s) to their mediator (use the same
+                # mediator for both)
                 if not await connect_wallet_to_mediator(alice, alice_mediator_agent):
                     log_msg("Mediation setup FAILED :-(")
                     raise Exception("Mediation setup FAILED :-(")
@@ -329,7 +347,7 @@ async def main(
             await alice.receive_invite(invite["invitation"])
             await asyncio.wait_for(faber.detect_connection(), 30)
 
-        if not ping_only:
+        if action != "ping":
             with log_timer("Publish duration:"):
                 await faber.publish_defs(revocation)
             # cache the credential definition
@@ -346,19 +364,36 @@ async def main(
 
         semaphore = asyncio.Semaphore(threads)
 
+        def done_propose(fut: asyncio.Task):
+            semaphore.release()
+            alice.check_task_exception(fut)
+
         def done_send(fut: asyncio.Task):
             semaphore.release()
             faber.check_task_exception(fut)
 
-        async def send_credential(index: int):
-            await semaphore.acquire()
-            comment = f"issue test credential {index}"
-            attributes = {
+        def test_cred(index: int) -> dict:
+            return {
                 "name": "Alice Smith",
-                "date": "2018-05-28",
+                "date": f"{2020+index}-05-28",
                 "degree": "Maths",
                 "age": "24",
             }
+
+        async def propose_credential(index: int):
+            await semaphore.acquire()
+            comment = f"propose test credential {index}"
+            attributes = test_cred(index)
+            asyncio.ensure_future(
+                alice.propose_credential(
+                    attributes, faber.credential_definition_id, comment, not revocation
+                )
+            ).add_done_callback(done_propose)
+
+        async def send_credential(index: int):
+            await semaphore.acquire()
+            comment = f"issue test credential {index}"
+            attributes = test_cred(index)
             asyncio.ensure_future(
                 faber.send_credential(attributes, comment, not revocation)
             ).add_done_callback(done_send)
@@ -407,7 +442,7 @@ async def main(
                 if reported >= issue_count:
                     break
 
-        if ping_only:
+        if action == "ping":
             recv_timer = faber.log_timer(f"Completed {issue_count} ping exchanges in")
             batch_timer = faber.log_timer(f"Started {batch_size} ping exchanges in")
         else:
@@ -423,7 +458,7 @@ async def main(
         with progress() as pb:
             receive_task = None
             try:
-                if ping_only:
+                if action == "ping":
                     issue_pg = pb(range(issue_count), label="Sending pings")
                     receive_pg = pb(range(issue_count), label="Responding pings")
                     check_received = check_received_pings
@@ -433,7 +468,10 @@ async def main(
                     issue_pg = pb(range(issue_count), label="Issuing credentials")
                     receive_pg = pb(range(issue_count), label="Receiving credentials")
                     check_received = check_received_creds
-                    send = send_credential
+                    if action == "propose":
+                        send = propose_credential
+                    else:
+                        send = send_credential
                     completed = f"Done starting {issue_count} credential exchanges in"
 
                 issue_task = asyncio.ensure_future(
@@ -459,8 +497,8 @@ async def main(
 
         recv_timer.stop()
         avg = recv_timer.duration / issue_count
-        item_short = "ping" if ping_only else "cred"
-        item_long = "ping exchange" if ping_only else "credential"
+        item_short = "ping" if action == "ping" else "cred"
+        item_long = "ping exchange" if action == "ping" else "credential"
         faber.log(f"Average time per {item_long}: {avg:.2f}s ({1/avg:.2f}/s)")
 
         if alice.postgres:
@@ -568,6 +606,12 @@ if __name__ == "__main__":
         help="Use DID-Exchange protocol for connections",
     )
     parser.add_argument(
+        "--proposal",
+        action="store_true",
+        default=False,
+        help="Start credential exchange with a credential proposal from Alice",
+    )
+    parser.add_argument(
         "--revocation", action="store_true", help="Enable credential revocation"
     )
     parser.add_argument(
@@ -605,6 +649,11 @@ if __name__ == "__main__":
         raise Exception(
             "If revocation is enabled, --tails-server-base-url must be provided"
         )
+    action = "issue"
+    if args.proposal:
+        action = "propose"
+    if args.ping:
+        action = "ping"
 
     require_indy()
 
@@ -613,7 +662,7 @@ if __name__ == "__main__":
             main(
                 args.port,
                 args.threads,
-                args.ping,
+                action,
                 args.timing,
                 args.multitenant,
                 args.mediation,
